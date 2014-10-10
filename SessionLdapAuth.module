@@ -8,7 +8,7 @@ class SessionLdapAuth extends WireData implements Module, ConfigurableModule {
     return array(
      "title" => "LDAP Authentication",
      "version" => 200,
-     "summary" => "Allows uses to be authenticated via LDAP",
+     "summary" => "Allows users to be authenticated via LDAP",
      "permanent" => false,
      "singular" => true,
      "autoload" => true
