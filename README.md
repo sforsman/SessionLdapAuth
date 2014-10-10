@@ -1,0 +1,4 @@
+SessionLdapAuth
+===============
+
+Example LDAP module
