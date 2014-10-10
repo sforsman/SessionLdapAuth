@@ -212,11 +212,6 @@ class SessionLdapAuth extends WireData implements Module, ConfigurableModule {
         "module"      => "InputfieldText",
         "description" => "The LDAP server domain",
       ),
-      "accountDomainNameShort"=>Array(
-        "label"       => "LDAP server domain (short)",
-        "module"      => "InputfieldText",
-        "description" => "The LDAP server hostname",
-      ),
       "baseDn"=>Array(
         "label"       => "Base DN",
         "module"      => "InputfieldText",
