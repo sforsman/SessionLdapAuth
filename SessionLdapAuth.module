@@ -1,0 +1,380 @@
+<?php
+class SessionLdapAuth extends WireData implements Module, ConfigurableModule {
+
+  protected $groupMapArray = false;
+
+  public static function getModuleInfo()
+  {
+    return array(
+     "title" => "LDAP Authentication",
+     "version" => 200,
+     "summary" => "Allows uses to be authenticated via LDAP",
+     "permanent" => false,
+     "singular" => true,
+     "autoload" => true
+    );
+  }
+
+  public function init()
+  {
+    $this->session->addHookBefore('login', $this, 'login');
+  }
+
+  public function isConfigured()
+  {
+    $required = Array(
+      "host",
+      "baseDn",
+      "accountDomainName",
+    );
+    foreach($required as $key)
+    {
+      if(empty($this->data[$key]))
+        return false;
+    }
+    return true;
+  }
+
+  public function login($event)
+  {
+    if(!$this->isConfigured())
+      return;
+    $user = wire('users')->get("name=".$event->arguments[0]);
+    if($user->id)
+      $haveLocal = true;
+    else
+      $haveLocal = false;
+
+    if($this->checkAlways)
+    {
+      if($this->defaultRole and $haveLocal)
+      {
+        $defaultRole = wire('roles')->get($this->defaultRole);
+        if(!$user->hasRole($defaultRole))
+          return; // The user didn't have the default role, expecting a local user
+      }
+      elseif(!$this->defaultRole and $haveLocal)
+      {
+        if($user->isSuperuser()) // Fail-safe mechanism
+          return;
+      }
+    }
+    else
+    {
+      if($haveLocal)
+        return;
+    }
+    $name = $event->arguments[0];
+    $pass = $event->arguments[1];
+
+    $conn = @ldap_connect($this->data['host']);
+    if($conn)
+    {
+      if($this->activeDirectory)
+      {
+        ldap_set_option($conn, LDAP_OPT_PROTOCOL_VERSION, 3);
+        ldap_set_option($conn, LDAP_OPT_REFERRALS, 0);
+      }
+      if($this->startTls)
+      {
+        // This is required for TLS
+        if(!$this->activeDirectory)
+          ldap_set_option($conn, LDAP_OPT_PROTOCOL_VERSION, 3);
+        if(!ldap_start_tls($conn))
+          throw new WireException("Failed to start TLS");
+      }
+
+      $bind = @ldap_bind($conn, "{$name}@{$this->data['accountDomainName']}", $pass);
+      if($bind)
+      {
+            // check if they are already a user in PW
+
+        $newUser = false;
+        if(!$user->id)
+        {
+          $user = wire('users')->add($name);
+          $user->addRole('guest');
+          $newUser = true;
+        }
+
+        $s = new LDAPSearcher($conn,$this->baseDn);
+
+        if($this->getEmail)
+        {
+          $email = $s->getUserEmail($name);
+          // Should or shouldn't we overwrite empty emails?
+          if($email)
+            $user->email = $email;
+        }
+
+        if($this->getGroups)
+        {
+          $this->handleGroupMapping($s,$user,$name);
+        }
+
+        if($this->defaultRole)
+        {
+          $defaultRole = wire('roles')->get($this->defaultRole);
+          if(!$user->hasRole($defaultRole))
+            $user->addRole($defaultRole);
+        }
+
+        $user->pass = $pass;
+        // And how do we check if roles were updated? if($user->isChanged('pass') or !$user->id)
+        $user->save();
+
+        // We don't need to do anything else, default handling will be fine
+        return;
+      }
+      else
+      {
+        $event->replace = true; // We override
+        $event->return = null; // This prevents the user from logging in with the old password
+        return;
+      }
+    }
+    else
+    {
+      // could not connect
+      throw new WireException($this->_('Could not connect to LDAP'));
+    }
+  }
+
+  // Handles the mapping of LDAP groups to PW roles
+  public function handleGroupMapping($s,$user,$name)
+  {
+    $userLdapGroups = $s->getUserGroups($name);
+    $groupMap = $this->getGroupMap();
+    if($groupMap)
+    {
+      $userAutoRoles = Array();
+      $allAutoRoles = array();
+      foreach($groupMap as $source=>$autoRoles)
+        $allAutoRoles = array_unique(array_merge($allAutoRoles,$autoRoles));
+      foreach($userLdapGroups as $ldapGroup)
+      {
+        if(!isset($groupMap[$ldapGroup]))
+          continue; // Ignore groups that don't have a mapping
+        foreach($groupMap[$ldapGroup] as $targetRoleName)
+        {
+          $targetRole = wire('roles')->get($targetRoleName);
+          if(!$targetRole)
+            continue; // Ignore silently
+          if(!$user->hasRole($targetRole))
+            $user->addRole($targetRole);
+          $userAutoRoles[] = $targetRoleName;
+        }
+      }
+      // We'll delete the roles that are included in the automatic mapping
+      // but the users isn't mapped to
+      $toBeRemoved = array_diff($allAutoRoles,$userAutoRoles);
+      foreach($toBeRemoved as $removedRoleName)
+      {
+        $removedRole = wire('roles')->get($removedRoleName);
+        if($user->hasRole($removedRole))
+          $user->removeRole($removedRole);
+      }
+    }
+  }
+
+  public function getGroupMap()
+  {
+    if(!$this->groupMap)
+      return Array();
+    elseif($this->groupMapArray !== false)
+      return $this->groupMapArray;
+
+    $output = Array();
+
+    // Quick and dirty, for now
+    $defs = explode(";",$this->groupMap);
+    foreach($defs as $def)
+    {
+      $pos = strpos($def,"=");
+      if($pos === false or $pos === 0)
+        continue; // Should we throw a WireException?
+      $source = trim(substr($def,0,$pos));
+      $target = array_map("trim",explode(",",substr($def,$pos+1)));
+      $output[$source] = $target; // No double checks atm
+    }
+    return $output;
+  }
+
+  static public function getModuleConfigInputfields(array $data) {
+    $fields = Array(
+      "host"=>Array(
+        "label"       => "Host",
+        "module"      => "InputfieldText",
+        "description" => "The LDAP server hostname",
+      ),
+      "accountDomainName"=>Array(
+        "label"       => "Account Domain Name",
+        "module"      => "InputfieldText",
+        "description" => "The LDAP server domain",
+      ),
+      "accountDomainNameShort"=>Array(
+        "label"       => "LDAP server domain (short)",
+        "module"      => "InputfieldText",
+        "description" => "The LDAP server hostname",
+      ),
+      "baseDn"=>Array(
+        "label"       => "Base DN",
+        "module"      => "InputfieldText",
+        "description" => "The LDAP server DN",
+      ),
+      "startTls"=>Array(
+        "label"       => "Enable TLS",
+        "module"      => "InputfieldCheckbox",
+        "description" => "Check this option to enable TLS security. This serves a different purpose than prefixing the host with ldaps://",
+        "checkable"   => true,
+      ),
+      "getEmail"=>Array(
+        "label"       => "Save the user's email",
+        "module"      => "InputfieldCheckbox",
+        "description" => "Check this option to enable searching of the user's email from the server",
+        "checkable"   => true,
+      ),
+      "getGroups"=>Array(
+        "label"       => "Map the LDAP groups to PW groups",
+        "module"      => "InputfieldCheckbox",
+        "description" => "Check this option to enable searching of the user's groups and mapping them to PW groups",
+        "checkable"   => true,
+      ),
+      "groupMap"=>Array(
+        "label"       => "Group map",
+        "module"      => "InputfieldText",
+        "description" => "Map the groups in the format <group_samaccountname>=<group_pwname>,<group_pwname2>[;<group_samaccountname>=<group_pwname>;...]",
+      ),
+      "activeDirectory"=>Array(
+        "label"       => "The host is an Active Directory -server",
+        "module"      => "InputfieldCheckbox",
+        "description" => "Check this option to enable proper support for AD (in fact your requests will hang, unless this is checked)",
+        "checkable"   => true,
+      ),
+      "checkAlways"=>Array(
+        "label"       => "Always check against the server ",
+        "module"      => "InputfieldCheckbox",
+        "description" => "Check this option to always check (and update) against the LDAP server",
+        "checkable"   => true,
+      ),
+      "defaultRole"=>Array(
+        "label"       => "Default role",
+        "module"      => "InputfieldText",
+        "description" => "Type here the role name that will be assigned to everybody by default (slightly alters the behavior of the previous setting)",
+      ),
+    );
+
+    $inputFields = new InputfieldWrapper();
+
+    foreach($fields as $fieldName=>$fieldSettings)
+    {
+      $field = wire('modules')->get($fieldSettings["module"]);
+      $field->attr('name', $fieldName);
+      $field->label = $fieldSettings["label"];
+      if(!empty($fieldSettings["checkable"]))
+      {
+        $field->attr('value', 1);
+        if(!empty($data[$fieldName]))
+          $field->attr('checked',true);
+      }
+      else
+      {
+        if(isset($data[$fieldName]))
+          $field->attr('value', $data[$fieldName]);
+      }
+      $field->description = $fieldSettings["description"];
+      $inputFields->append($field);
+    }
+    return $inputFields;
+  }
+}
+
+// A little helper class to make the module cleaner
+class LDAPSearcher
+{
+  protected $link;
+  protected $baseDn;
+  protected $userData = Array();
+  protected $lastUser;
+
+  public function __construct($link,$baseDn)
+  {
+    if(!is_resource($link))
+      throw new Exception("A valid LDAP-link is expected");
+    $this->link = $link;
+    $this->baseDn = $baseDn;
+  }
+
+  public function findUser($user)
+  {
+    if(strcmp($user,$this->lastUser) == 0 and count($this->userData) > 0)
+      return true;
+
+    $this->userData = Array();
+
+    $this->lastUser = $user;
+
+    $fields = Array("cn","samaccountname","givenname","name","mail");
+
+    $filter = "(&(samAccountName={$user})(objectCategory=person)(objectClass=user))";
+    $r = ldap_search($this->link,$this->baseDn,$filter,$fields);
+    if($r === false)
+      throw new WireException($this->_('Could not query the LDAP server'));
+    $data = ldap_get_entries($this->link,$r);
+    if($data["count"] == 0)
+    {
+      foreach($fields as $field)
+        $this->userData[$field] = "";
+      $this->userData["dn"] = "";
+      return false;
+    }
+    // We'll just use the first result, there shouldn't be more
+    $resultKey = 0;
+    foreach($fields as $field)
+    {
+      // We'll also use just the first item (there shouldn't be more)
+      $subResultKey = 0;
+      if(empty($data[$resultKey][$field]["count"]))
+        $this->userData[$field] = "";
+      else
+        $this->userData[$field] = $data[$resultKey][$field][$subResultKey];
+    }
+    $this->userData["dn"] = $data[$resultKey]["dn"];
+    return true;
+  }
+
+  public function getUserEmail($user)
+  {
+    $this->findUser($user);
+    // We could also get these from the proxyaddresses collection, but this
+    // should get the default email.
+    return $this->userData["mail"];
+  }
+
+  public function getUserGroups($user)
+  {
+    if(!$this->findUser($user)) // A search is needed, because we need the full dn of the user
+      return Array();
+    elseif(strcmp($user,$this->lastUser) == 0 and isset($this->userData["groups"]))
+      return $this->userData["groups"];
+
+    $fields = Array("cn","name","samaccountname");
+    $filter = "(&(member={$this->userData["dn"]})(objectCategory=group))";
+    $r = ldap_search($this->link,$this->baseDn,$filter,$fields);
+    if($r === false)
+      throw new WireException($this->_('Could not query the LDAP server'));
+    $data = ldap_get_entries($this->link,$r);
+    $this->userData["groups"] = Array();
+    if($data["count"] > 0)
+    {
+      $subResultKey = 0; // We'll also use just the first item (there shouldn't be more)
+      for($resultKey=0;$resultKey<$data["count"];$resultKey++)
+      {
+        if(!empty($data[$resultKey]["samaccountname"][$subResultKey]))
+          $this->userData["groups"][] = $data[$resultKey]["samaccountname"][$subResultKey];
+      }
+    }
+    return $this->userData["groups"];
+  }
+}
+
